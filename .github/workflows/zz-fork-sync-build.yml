@@ -1,0 +1,148 @@
+# Форк storytold/gridcraft: синхронизация с оригиналом + сборка под macOS (Apple silicon).
+#
+# Каждые 6 часов (и по кнопке "Run workflow") workflow:
+#   1. вливает свежий storytold/gridcraft@main в main этого форка и пушит;
+#   2. отключает upstream-workflow (ci, nix, release...), чтобы они не жгли минуты в форке;
+#   3. если пришли новые коммиты (или сборки ещё нет / force_build) — собирает GridCraft.app
+#      на macos-latest и выкладывает DMG + CLI в пре-релиз "macos-build" (перезаписывается).
+#
+# ВАЖНО: GITHUB_TOKEN не может пушить коммиты, которые меняют .github/workflows/*, а upstream
+# их меняет регулярно. Поэтому нужен секрет SYNC_TOKEN — fine-grained PAT только на этот репозиторий
+# с правами Contents: Read and write и Workflows: Read and write.
+name: Fork sync & macOS build
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Пересобрать, даже если upstream не менялся"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: fork-sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/storytold/gridcraft.git
+  UPSTREAM_BRANCH: main
+  RELEASE_TAG: macos-build
+  THIS_WORKFLOW: zz-fork-sync-build.yml
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream into main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          up="upstream/$UPSTREAM_BRANCH"
+          before="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "main уже содержит $(git rev-parse --short "$up")"
+          else
+            git merge --no-edit -m "Merge upstream $(git rev-parse --short "$up")" "$up"
+          fi
+          after="$(git rev-parse HEAD)"
+          if [ "$before" != "$after" ]; then
+            if ! git push origin HEAD:main; then
+              echo "::error::Push не прошёл. Скорее всего upstream изменил .github/workflows, а секрета SYNC_TOKEN нет (или у него нет права Workflows: write)."
+              exit 1
+            fi
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          fi
+          echo "sha=$after" >>"$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse "$up")" >>"$GITHUB_OUTPUT"
+
+      - name: Disable upstream workflows in the fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --all --json id,path,state \
+            -q ".[] | select(.state == \"active\") | select(.path | endswith(\"/$THIS_WORKFLOW\") | not) | .id" |
+          while read -r id; do
+            [ -n "$id" ] && gh workflow disable "$id" && echo "disabled workflow $id" || true
+          done
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGED: ${{ steps.merge.outputs.changed }}
+          FORCE: ${{ inputs.force_build || false }}
+        run: |
+          build=false
+          if [ "$CHANGED" = true ] || [ "$FORCE" = true ]; then build=true; fi
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then build=true; fi
+          echo "build=$build" | tee -a "$GITHUB_OUTPUT"
+
+  build-macos:
+    name: Build macOS (Apple silicon)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Ad-hoc подпись (без Apple Developer ID): на своём Маке запускается после снятия карантина.
+      - name: Build & package (DMG + CLI)
+        run: packaging/macos/package.sh --arch aarch64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gridcraft-macos-aarch64
+          path: dist/release/*
+          retention-days: 14
+
+      - name: Publish rolling pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE_TAG" dist/release/* \
+            --prerelease --target "$SHA" \
+            --title "macOS build — upstream ${UPSTREAM_SHA:0:7} ($(date -u +%Y-%m-%d))" \
+            --notes "Автосборка storytold/gridcraft@${UPSTREAM_SHA} для Apple silicon (ad-hoc подпись).
+
+          После скачивания: открыть DMG, перетащить GridCraft в Applications, затем
+          \`xattr -dr com.apple.quarantine /Applications/GridCraft.app\`"
